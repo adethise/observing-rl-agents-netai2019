@@ -230,7 +230,7 @@ class Explanation:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Create explanations of a state trace')
     parser.add_argument('trace')
-    parser.add_argument('output_file', help = 'save the model to a file for fast reloading', nargs = '?')
+    parser.add_argument('output_file', help = 'save the model to a file for fast reloading')
 
     args = parser.parse_args()
 

@@ -1,19 +1,22 @@
 import os
 import sys
+
+import pickle
+import argparse
+
 os.environ['CUDA_VISIBLE_DEVICES']=''
 import numpy as np
 import tensorflow as tf
+
 import load_trace
 import a3c
-import fixed_env as env
-import pickle
+import env
 
 
 S_INFO = 6  # bit_rate, buffer_size, next_chunk_size, bandwidth_measurement(throughput and time), chunk_til_video_end
 S_LEN = 8  # take how many frames in the past
 A_DIM = 6
 ACTOR_LR_RATE = 0.0001
-CRITIC_LR_RATE = 0.001
 VIDEO_BIT_RATE = [300,750,1200,1850,2850,4300]  # Kbps
 BUFFER_NORM_FACTOR = 10.0
 CHUNK_TIL_VIDEO_END_CAP = 48.0
@@ -23,67 +26,15 @@ SMOOTH_PENALTY = 1
 DEFAULT_QUALITY = 1  # default video quality without agent
 RANDOM_SEED = 42
 RAND_RANGE = 1000
-LOG_FILE = './test_results/log_sim_rl'
-TEST_TRACES = './cooked_test_traces/'
-# log in format of time_stamp bit_rate buffer_size rebuffer_time chunk_size download_time reward
+
+np.random.seed(RANDOM_SEED)
 
 
-NUM_FEATURES = 1
-FEATURES = [
-        ('last_quality_7',      0.250097,       (0, -1)),
-        ('buffer_7',            1.573854,       (1, -1)),
-        ('throughput_7',        0.155318,       (2, -1)),
-        ('throughput_6',        0.155318,       (2, -2)),
-        ('latency_6',           0.374323,       (3, -2)),
-        ('latency_7',           0.374323,       (3, -1)),
-        ('throughput_0',        0.155318,       (2, -8)),
-        ('latency_0',           0.374323,       (3, -8)),
-        ('throughput_5',        0.155318,       (2, -3)),
-        ('latency_5',           0.374323,       (3, -3)),
-        ('latency_4',           0.374323,       (3, -4)),
-        ('throughput_3',        0.155318,       (2, -5)),
-        ('throughput_2',        0.155318,       (2, -6)),
-        ('latency_3',           0.374323,       (3, -5)),
-        ('latency_2',           0.374323,       (3, -6)),
-        ('latency_1',           0.374323,       (3, -7)),
-        ('throughput_1',        0.155318,       (2, -7)),
-        ('next_size_5',         2.158495,       (4,  5)),
-        ('next_size_4',         1.437556,       (4,  4)),
-        ('next_size_1',         0.380457,       (4,  1)),
-        ('next_size_3',         0.931950,       (4,  3)),
-        ('next_size_2',         0.605353,       (4,  2)),
-        ('remaining_chunks_7',  0.5,            (5, -1)),
-        ('next_size_0',         0.153233,       (4,  0)),
-        ('throughput_4',        0.155318,       (2, -4)),
-        ]
+def main(nn_model, net_traces, output_dir):
 
-MASK = np.zeros((6, 8))
-
-
-def main(nn_model, trace_files, num_features = NUM_FEATURES):
-    output_dir = f'inclusion_agent_traces_{num_features}'
-
-    for i, (f, v, p) in enumerate(FEATURES[:num_features]):
-        print('Included:', f)
-        MASK[p] = 1
-    for i, (f, v, p) in enumerate(FEATURES[num_features:]):
-        print('Excluded:', f, f'(default {v})')
-
-    np.set_printoptions(linewidth = 120)
-    print(MASK)
-
-
-    np.random.seed(RANDOM_SEED)
-
-    assert len(VIDEO_BIT_RATE) == A_DIM
-
-    all_cooked_time, all_cooked_bw, all_file_names = load_trace.load_trace(trace_files)
-
+    all_cooked_time, all_cooked_bw, all_file_names = load_trace.load_trace(net_traces)
     net_env = env.Environment(all_cooked_time=all_cooked_time,
                               all_cooked_bw=all_cooked_bw)
-
-    log_path = LOG_FILE + '_' + all_file_names[net_env.trace_idx]
-    log_file = open(log_path, 'w')
 
     with tf.Session() as sess:
 
@@ -91,17 +42,12 @@ def main(nn_model, trace_files, num_features = NUM_FEATURES):
                                  state_dim=[S_INFO, S_LEN], action_dim=A_DIM,
                                  learning_rate=ACTOR_LR_RATE)
 
-        critic = a3c.CriticNetwork(sess,
-                                   state_dim=[S_INFO, S_LEN],
-                                   learning_rate=CRITIC_LR_RATE)
-
         sess.run(tf.global_variables_initializer())
         saver = tf.train.Saver()  # save neural net parameters
 
         # restore neural net parameters
-        if nn_model is not None:  # NN_MODEL is the path to file
-            saver.restore(sess, nn_model)
-            print("Testing model restored.")
+        saver.restore(sess, nn_model)
+        print("Testing model restored.")
 
         time_stamp = 0
 
@@ -141,16 +87,6 @@ def main(nn_model, trace_files, num_features = NUM_FEATURES):
 
             last_bit_rate = bit_rate
 
-            # log time_stamp, bit_rate, buffer_size, reward
-            log_file.write(str(time_stamp / M_IN_K) + '\t' +
-                           str(VIDEO_BIT_RATE[bit_rate]) + '\t' +
-                           str(buffer_size) + '\t' +
-                           str(rebuf) + '\t' +
-                           str(video_chunk_size) + '\t' +
-                           str(delay) + '\t' +
-                           str(reward) + '\n')
-            log_file.flush()
-
             # retrieve previous state
             if len(s_batch) == 0:
                 state = [np.zeros((S_INFO, S_LEN))]
@@ -168,13 +104,6 @@ def main(nn_model, trace_files, num_features = NUM_FEATURES):
             state[4, :A_DIM] = np.array(next_video_chunk_sizes) / M_IN_K / M_IN_K  # mega byte
             state[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
 
-            state *= MASK
-
-            for f, v, p in FEATURES[num_features:]:
-                state[p] = v
-
-            #print(state)
-
             action_prob = actor.predict(np.reshape(state, (1, S_INFO, S_LEN)))
             action_cumsum = np.cumsum(action_prob)
             bit_rate = (action_cumsum > np.random.randint(1, RAND_RANGE) / float(RAND_RANGE)).argmax()
@@ -190,17 +119,14 @@ def main(nn_model, trace_files, num_features = NUM_FEATURES):
 
             s_batch.append(state)
 
-            entropy_record.append(a3c.compute_entropy(action_prob[0]))
-
             if end_of_video:
-                log_file.write('\n')
-                log_file.close()
-
                 filename = all_file_names[net_env.trace_idx-1].split('/')[-1]
-                with open(f'{output_dir}/{filename}.csv', 'w') as _f:
-                    _f.write(''.join(state_tabular_record))
+                output_file = f'{output_dir}/{filename}.csv'
 
-                state_tabular_record = list()
+                with open(output_file, 'w') as out:
+                    out.write(''.join(state_tabular_record))
+
+                del state_tabular_record[:]
 
                 last_bit_rate = DEFAULT_QUALITY
                 bit_rate = DEFAULT_QUALITY  # use the default action here
@@ -214,20 +140,19 @@ def main(nn_model, trace_files, num_features = NUM_FEATURES):
 
                 s_batch.append(np.zeros((S_INFO, S_LEN)))
                 a_batch.append(action_vec)
-                entropy_record = []
 
                 video_count += 1
 
                 if video_count >= len(all_file_names):
                     break
 
-                log_path = LOG_FILE + '_' + all_file_names[net_env.trace_idx]
-                log_file = open(log_path, 'w')
-
 
 if __name__ == '__main__':
-    nn_model = sys.argv[1]
-    num_features = int(sys.argv[2])
-    infiles = sys.argv[3:]
+    parser = argparse.ArgumentParser(description='Generate execution traces from network information')
+    parser.add_argument('nn_model')
+    parser.add_argument('net_traces', help='Network state traces', nargs='+')
+    parser.add_argument('output_dir')
 
-    main(nn_model, infiles, num_features)
+    args = parser.parse_args()
+
+    main(args.nn_model, args.net_traces, args.output_dir)
